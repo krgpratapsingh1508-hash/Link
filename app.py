@@ -23,7 +23,6 @@ DEFAULT_URL = "https://krg.ac.in/notice/355/"
 
 
 def fetch(url, timeout=60):
-    # verify=False: kuch college sites ka SSL certificate cloud par fail ho jata hai
     r = requests.get(url, headers=HEADERS, timeout=timeout, verify=False)
     r.raise_for_status()
     return r
@@ -43,13 +42,11 @@ def get_notice_info(url):
     m = re.search(r"Published on\s+([^\n<]+)", soup.get_text("\n"))
     date = m.group(1).strip() if m else ""
 
-    # Notice ki PDF: pehle /media/notices/ wali, poore HTML me kahin bhi (a, iframe, embed, object, JS)
     pdf_url = ""
     found = re.findall(r"""["'(=\s]([^"'\s()<>]*?/media/notices/[^"'\s()<>]*?\.pdf)""", html, flags=re.I)
     if found:
         pdf_url = urljoin(url, found[0])
     else:
-        # Fallback: koi bhi .pdf jo header ki static/images wali na ho
         for tag, attr in (("a", "href"), ("iframe", "src"), ("embed", "src"), ("object", "data")):
             for el in soup.find_all(tag):
                 link = el.get(attr, "")
@@ -87,18 +84,26 @@ def extract_table(pdf_bytes):
     header = rows[0]
     body = [r for r in rows[1:] if r != header]
     header = [h if h else f"Column {i + 1}" for i, h in enumerate(header)]
-    return pd.DataFrame(body, columns=header)
+    # duplicate column names ko alag karo
+    seen = {}
+    uniq = []
+    for h in header:
+        seen[h] = seen.get(h, 0) + 1
+        uniq.append(h if seen[h] == 1 else f"{h}_{seen[h]}")
+    return pd.DataFrame(body, columns=uniq)
 
 
-def to_excel_bytes(df, info):
+def add_title(df, title):
+    df = df.copy()
+    df["Title"] = title
+    return df
+
+
+def to_excel_bytes(df, status_df):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Roll List", index=False)
-        pd.DataFrame(
-            {"Field": ["Title", "Published on", "Notice page", "PDF link"],
-             "Value": [info.get("title", ""), info.get("date", ""),
-                       info.get("page_url", ""), info.get("pdf_url", "")]}
-        ).to_excel(writer, sheet_name="Notice Info", index=False)
+        df.to_excel(writer, sheet_name="All Data", index=False)
+        status_df.to_excel(writer, sheet_name="Notice Info", index=False)
         for ws in writer.book.worksheets:
             for col in ws.columns:
                 longest = max(len(str(c.value)) if c.value is not None else 0 for c in col)
@@ -106,14 +111,20 @@ def to_excel_bytes(df, info):
     return buf.getvalue()
 
 
-def show_result(df, info):
-    st.success(f"{len(df)} rows mil gayi")
-    st.dataframe(df, use_container_width=True)
-    fname = re.sub(r"[^A-Za-z0-9._-]+", "_", info.get("title") or "notice") + ".xlsx"
+def show_result(frames, status_rows):
+    status_df = pd.DataFrame(status_rows)
+    st.subheader("Status")
+    st.dataframe(status_df, use_container_width=True)
+    if not frames:
+        st.error("Kisi bhi link/PDF se data nahi mila.")
+        return
+    big = pd.concat(frames, ignore_index=True).fillna("")
+    st.success(f"Total {len(big)} rows, {len(frames)} notice se")
+    st.dataframe(big, use_container_width=True)
     st.download_button(
         "⬇️ Excel download karo",
-        data=to_excel_bytes(df, info),
-        file_name=fname,
+        data=to_excel_bytes(big, status_df),
+        file_name="notices_data.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -121,38 +132,48 @@ def show_result(df, info):
 st.set_page_config(page_title="Notice to Excel", page_icon="📄")
 st.title("📄 KRG Notice → Excel")
 
-tab1, tab2 = st.tabs(["🔗 Link se", "📤 PDF upload karke"])
+tab1, tab2 = st.tabs(["🔗 Links se", "📤 PDF upload karke"])
 
 with tab1:
-    url = st.text_input("Notice link", value=DEFAULT_URL)
+    links_text = st.text_area(
+        "Notice links (har line me ek link, 10 ya zyada bhi chalenge)",
+        value=DEFAULT_URL,
+        height=200,
+    )
     if st.button("Excel banao", type="primary"):
-        step = "start"
-        try:
-            step = "notice page fetch"
-            info = get_notice_info(url.strip())
-            st.write("**Title:**", info["title"] or "(nahi mila)")
-            st.write("**Date:**", info["date"] or "(nahi mili)")
-            st.write("**PDF link:**", info["pdf_url"] or "(nahi mila)")
-            if not info["pdf_url"]:
-                st.error("PDF link nahi mila. Dusre tab me PDF upload karke try kijiye.")
-            else:
-                step = "PDF download"
-                pdf_bytes = fetch(info["pdf_url"]).content
-                st.write(f"PDF size: {len(pdf_bytes) // 1024} KB")
-                step = "table extract"
-                df = extract_table(pdf_bytes)
-                show_result(df, info)
-        except Exception as e:
-            st.error(f"Step '{step}' me error: {e}")
-            st.code(traceback.format_exc())
-            st.info("Agar site cloud se block ho rahi hai, to dusre tab me PDF khud upload kar dijiye.")
+        urls = [u.strip() for u in links_text.splitlines() if u.strip()]
+        frames, status_rows = [], []
+        bar = st.progress(0.0)
+        for i, u in enumerate(urls, 1):
+            row = {"Link": u, "Title": "", "Rows": 0, "Result": ""}
+            try:
+                info = get_notice_info(u)
+                row["Title"] = info["title"]
+                if not info["pdf_url"]:
+                    raise RuntimeError("PDF link nahi mila")
+                df = extract_table(fetch(info["pdf_url"]).content)
+                frames.append(add_title(df, info["title"]))
+                row["Rows"] = len(df)
+                row["Result"] = "OK"
+            except Exception as e:
+                row["Result"] = f"Error: {e}"
+            status_rows.append(row)
+            bar.progress(i / len(urls))
+        show_result(frames, status_rows)
 
 with tab2:
-    up = st.file_uploader("Roll list PDF upload kijiye", type=["pdf"])
-    if up is not None:
-        try:
-            df = extract_table(up.read())
-            show_result(df, {"title": up.name.rsplit(".", 1)[0]})
-        except Exception as e:
-            st.error(f"Error: {e}")
-            st.code(traceback.format_exc())
+    ups = st.file_uploader("Roll list PDF upload kijiye (ek ya zyada)", type=["pdf"], accept_multiple_files=True)
+    if ups and st.button("PDF se Excel banao", type="primary"):
+        frames, status_rows = [], []
+        for up in ups:
+            title = up.name.rsplit(".", 1)[0]
+            row = {"Link": up.name, "Title": title, "Rows": 0, "Result": ""}
+            try:
+                df = extract_table(up.read())
+                frames.append(add_title(df, title))
+                row["Rows"] = len(df)
+                row["Result"] = "OK"
+            except Exception as e:
+                row["Result"] = f"Error: {e}"
+            status_rows.append(row)
+        show_result(frames, status_rows)
