@@ -30,7 +30,8 @@ def fetch(url, timeout=60):
 
 
 def get_notice_info(url):
-    soup = BeautifulSoup(fetch(url).text, "html.parser")
+    html = fetch(url).text
+    soup = BeautifulSoup(html, "html.parser")
 
     title = ""
     for h1 in soup.find_all("h1"):
@@ -42,15 +43,20 @@ def get_notice_info(url):
     m = re.search(r"Published on\s+([^\n<]+)", soup.get_text("\n"))
     date = m.group(1).strip() if m else ""
 
+    # Notice ki PDF: pehle /media/notices/ wali, poore HTML me kahin bhi (a, iframe, embed, object, JS)
     pdf_url = ""
-    for a in soup.find_all("a", href=True):
-        if ".pdf" in a["href"].lower() and "/media/" in a["href"].lower():
-            pdf_url = urljoin(url, a["href"])
-            break
-    if not pdf_url:
-        for a in soup.find_all("a", href=True):
-            if ".pdf" in a["href"].lower():
-                pdf_url = urljoin(url, a["href"])
+    found = re.findall(r"""["'(=\s]([^"'\s()<>]*?/media/notices/[^"'\s()<>]*?\.pdf)""", html, flags=re.I)
+    if found:
+        pdf_url = urljoin(url, found[0])
+    else:
+        # Fallback: koi bhi .pdf jo header ki static/images wali na ho
+        for tag, attr in (("a", "href"), ("iframe", "src"), ("embed", "src"), ("object", "data")):
+            for el in soup.find_all(tag):
+                link = el.get(attr, "")
+                if ".pdf" in link.lower() and "/static/images/" not in link.lower():
+                    pdf_url = urljoin(url, link)
+                    break
+            if pdf_url:
                 break
     return {"title": title, "date": date, "page_url": url, "pdf_url": pdf_url}
 
