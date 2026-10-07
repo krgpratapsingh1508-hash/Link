@@ -58,6 +58,34 @@ def get_notice_info(url):
     return {"title": title, "date": date, "page_url": url, "pdf_url": pdf_url}
 
 
+def _norm(x):
+    return re.sub(r"[^a-z0-9\u0900-\u097f]", "", str(x).lower())
+
+
+def std_header(h):
+    """Alag-alag PDF ke header ko ek jaise naam do."""
+    n = _norm(h)
+    if not n:
+        return ""
+    if n in ("sno", "srno", "slno", "serialno", "serialnumber", "sr", "sl", "no", "क्र", "क्रमांक", "क्रसं", "क्रम") \
+            or n.startswith(("sno", "srno", "slno", "serialno", "क्र")):
+        return "S. No."
+    if "father" in n or "mother" in n or "guardian" in n or "पिता" in n or "माता" in n:
+        return "Father/Mother Name"
+    if "name" in n or "नाम" in n:
+        return "Student Name"
+    if "enrol" in n or "enrl" in n:
+        return "Enrollment No."
+    if "roll" in n or "रोल" in n:
+        return "Roll No."
+    return str(h).strip()
+
+
+def _is_header_row(row):
+    hit = {std_header(c) for c in row}
+    return "Student Name" in hit or ("S. No." in hit and len(hit & {"Roll No.", "Enrollment No.", "Father/Mother Name"}) > 0)
+
+
 def extract_table(pdf_bytes):
     if pdfplumber is None:
         raise RuntimeError(f"pdfplumber import nahi hua: {PDF_IMPORT_ERROR}")
@@ -81,15 +109,26 @@ def extract_table(pdf_bytes):
 
     width = max(len(r) for r in rows)
     rows = [r + [""] * (width - len(r)) for r in rows]
-    header = rows[0]
-    body = [r for r in rows[1:] if r != header]
+
+    h_idx = next((i for i, r in enumerate(rows[:25]) if _is_header_row(r)), None)
+    if h_idx is not None:
+        header = [std_header(c) for c in rows[h_idx]]
+        body = rows[h_idx + 1:]
+    elif rows[0][0].strip().isdigit():
+        header = ["S. No.", "Student Name"] + [f"Column {i + 1}" for i in range(2, width)]
+        body = rows
+    else:
+        header = [std_header(c) for c in rows[0]]
+        body = rows[1:]
+
     header = [h if h else f"Column {i + 1}" for i, h in enumerate(header)]
-    # duplicate column names ko alag karo
-    seen = {}
-    uniq = []
+    seen, uniq = {}, []
     for h in header:
         seen[h] = seen.get(h, 0) + 1
         uniq.append(h if seen[h] == 1 else f"{h}_{seen[h]}")
+
+    hn = [_norm(std_header(c)) for c in header]
+    body = [r for r in body if [_norm(std_header(c)) for c in r] != hn]
     return pd.DataFrame(body, columns=uniq)
 
 
