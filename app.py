@@ -1,3 +1,5 @@
+import datetime
+import importlib.util
 import io
 import os
 import re
@@ -8,9 +10,10 @@ import zipfile
 import zlib
 from urllib.parse import urljoin
 
+import numpy as np
 import pandas as pd
 import requests
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 import streamlit as st
 from bs4 import BeautifulSoup
 
@@ -45,6 +48,12 @@ try:
 except Exception as e:
     pdfium = None
     PDFIUM_ERROR = str(e)
+
+try:
+    import cv2
+except Exception as e:
+    cv2 = None
+    CV2_ERROR = str(e)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -633,10 +642,73 @@ def _flatten_on(im, bg):
     return im.convert("RGB")
 
 
-def make_passport(img, w_mm, h_mm, zoom, off_x, off_y, bg, dpi=300):
-    """Photo ko w_mm x h_mm me katkar do. zoom<1 par kinare bg rang se bhar jate hain."""
+HAS_REMBG = importlib.util.find_spec("rembg") is not None
+AI_MODELS = {"Halka aur tez (silueta)": "silueta", "Behtar, par bhaari (u2net_human_seg)": "u2net_human_seg"}
+
+
+def cutout_simple(img, tol=60):
+    """Ek rang ke (plain) background ko hatao. Kinare se shuru karke milte-julte rang ko transparent karta hai.
+    Return: (RGBA image, hataye gaye hisse ka fraction)"""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    sc = min(1.0, 700 / max(w, h))
+    small = rgb.resize((max(1, int(w * sc)), max(1, int(h * sc))), Image.BILINEAR)
+    sw, sh = small.size
+    arr = np.asarray(small).astype(int)
+    border = np.concatenate([arr[:3].reshape(-1, 3), arr[:, :3].reshape(-1, 3), arr[:, -3:].reshape(-1, 3)])
+    bgc = np.median(border, axis=0)
+    work = small.copy()
+    mark = (255, 0, 255)
+    seeds = ([(x, 0) for x in range(0, sw, 2)] + [(x, sh - 1) for x in range(0, sw, 2)]
+             + [(0, y) for y in range(0, sh, 2)] + [(sw - 1, y) for y in range(0, sh, 2)])
+    for xy in seeds:
+        px = work.getpixel(xy)
+        if px == mark:
+            continue
+        if sum(abs(px[i] - bgc[i]) for i in range(3)) <= tol * 1.5:
+            ImageDraw.floodfill(work, xy, mark, thresh=tol)
+    bgmask = (np.asarray(work) == np.array(mark)).all(axis=2)
+    frac = float(bgmask.mean())
+    m = Image.fromarray((bgmask * 255).astype("uint8"), "L")
+    m = m.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.GaussianBlur(1.1))  # kinara thoda andar + naram
+    alpha = ImageChops.invert(m.resize((w, h), Image.BICUBIC))
+    out = img.convert("RGBA")
+    out.putalpha(alpha)
+    return out, frac
+
+
+def cutout_ai(img, session):
+    from rembg import remove
+    out = remove(img.convert("RGB"), session=session).convert("RGBA")
+    frac = 1.0 - float(np.asarray(out.split()[3]).mean()) / 255.0
+    return out, frac
+
+
+def _font(size):
+    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", "arialbd.ttf"):
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _fit_font(draw, text, max_w, size):
+    size = max(10, int(size))
+    while size > 10:
+        f = _font(size)
+        if draw.textlength(text, font=f) <= max_w:
+            return f
+        size -= 2
+    return _font(10)
+
+
+def _crop_to(src, w_mm, h_mm, zoom, off_x, off_y, bg, dpi):
     W, H = round(w_mm / 25.4 * dpi), round(h_mm / 25.4 * dpi)
-    src = _flatten_on(img, bg)
     aspect = w_mm / h_mm
     bh = min(src.height, src.width / aspect) / zoom
     bw = bh * aspect
@@ -646,6 +718,31 @@ def make_passport(img, w_mm, h_mm, zoom, off_x, off_y, bg, dpi=300):
     canvas = Image.new("RGB", (max(1, int(round(bw))), max(1, int(round(bh)))), bg)
     canvas.paste(src, (-x0, -y0))
     return canvas.resize((W, H), Image.LANCZOS)
+
+
+def make_passport(img, w_mm, h_mm, zoom, off_x, off_y, bg, dpi=300, lines=None, mode="inside", strip_mm=7.0):
+    """Photo ko w_mm x h_mm me katkar do. zoom<1 par kinare bg rang se bhar jate hain.
+    lines: photo ke neeche likhne wali lines (naam/date). mode: 'inside' = size same, strip photo ke andar;
+    'below' = strip photo ke neeche alag se judti hai."""
+    src = _flatten_on(img, bg)
+    lines = [l for l in (lines or []) if str(l).strip()]
+    if not lines:
+        return _crop_to(src, w_mm, h_mm, zoom, off_x, off_y, bg, dpi)
+    strip_px = round(strip_mm / 25.4 * dpi)
+    main = _crop_to(src, w_mm, (h_mm - strip_mm) if mode == "inside" else h_mm, zoom, off_x, off_y, bg, dpi)
+    canvas = Image.new("RGB", (main.width, main.height + strip_px), "white")
+    canvas.paste(main, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    line_h = strip_px / len(lines)
+    pad = max(4, int(main.width * 0.04))
+    for i, text in enumerate(lines):
+        f = _fit_font(draw, text, main.width - 2 * pad, line_h * 0.78)
+        cy = main.height + line_h * (i + 0.5)
+        try:
+            draw.text((main.width / 2, cy), text, fill="black", font=f, anchor="mm")
+        except Exception:
+            draw.text((pad, cy - line_h * 0.4), text, fill="black", font=f)
+    return canvas
 
 
 def make_sheet(photo, paper, copies=None, guides=True, dpi=300, margin_mm=2.0, gap_mm=1.0):
@@ -682,6 +779,120 @@ def make_sheet(photo, paper, copies=None, guides=True, dpi=300, margin_mm=2.0, g
         if guides:
             draw.rectangle([x - 1, y - 1, x + w, y + h], outline="#9AA3B2")
     return sheet, cols * rows
+
+
+
+# ---------- background badlo (cutout) ----------
+def _largest_filled(mask):
+    """Sabse bada hissa rakho aur uske andar ke chhed bhar do."""
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return mask
+    big = max(cnts, key=cv2.contourArea)
+    out = np.zeros_like(mask)
+    cv2.drawContours(out, [big], -1, 255, thickness=-1)
+    return out
+
+
+def _mask_simple(arr, tol):
+    """Plain background: kinare ke rang jaisa jo hissa kinare se juda ho, wo background."""
+    h, w, _ = arr.shape
+    t = max(2, int(min(h, w) * 0.03))
+    border = np.concatenate([arr[:t].reshape(-1, 3), arr[-t:].reshape(-1, 3),
+                             arr[:, :t].reshape(-1, 3), arr[:, -t:].reshape(-1, 3)])
+    bgc = np.median(border, axis=0)
+    dist = np.sqrt(((arr.astype(np.float32) - bgc) ** 2).sum(axis=2))
+    cand = (dist < tol).astype(np.uint8)
+    _, lab = cv2.connectedComponents(cand, connectivity=4)
+    edge_labels = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))) - {0}
+    bg = np.isin(lab, list(edge_labels)) if edge_labels else np.zeros(cand.shape, bool)
+    person = (~bg).astype(np.uint8) * 255
+    person = cv2.morphologyEx(person, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return _largest_filled(person)
+
+
+def _mask_grabcut(arr):
+    """Kisi bhi background ke liye: GrabCut (beech me insaan hone ka andaza lagata hai)."""
+    h, w, _ = arr.shape
+    sc = 640 / max(h, w) if max(h, w) > 640 else 1.0
+    small = cv2.resize(arr, (max(1, int(w * sc)), max(1, int(h * sc))), interpolation=cv2.INTER_AREA) if sc < 1 else arr.copy()
+    sh, sw, _ = small.shape
+    m = np.full((sh, sw), cv2.GC_PR_BGD, np.uint8)
+    m[int(sh * .04):int(sh * .98), int(sw * .06):int(sw * .94)] = cv2.GC_PR_FGD
+    m[int(sh * .45):int(sh * .95), int(sw * .40):int(sw * .60)] = cv2.GC_FGD
+    bt = max(2, int(min(sh, sw) * .02))
+    m[:bt] = cv2.GC_BGD
+    m[-bt:] = cv2.GC_BGD
+    m[:, :bt] = cv2.GC_BGD
+    m[:, -bt:] = cv2.GC_BGD
+    bgd, fgd = np.zeros((1, 65)), np.zeros((1, 65))
+    cv2.grabCut(cv2.cvtColor(small, cv2.COLOR_RGB2BGR), m, None, bgd, fgd, 5, cv2.GC_INIT_WITH_MASK)
+    fg = ((m == cv2.GC_FGD) | (m == cv2.GC_PR_FGD)).astype(np.uint8) * 255
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    fg = _largest_filled(fg)
+    return cv2.resize(fg, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def cutout_from_bytes(data, mode, tol=45, shrink=1):
+    """Purana background hatao. Return: (RGBA image, kitna hissa insaan maana gaya 0-1)"""
+    if cv2 is None:
+        raise RuntimeError(f"opencv install nahi hai: {CV2_ERROR}")
+    im = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    im.load()
+    rgb = _flatten_on(im, "#FFFFFF")
+    if max(rgb.size) > 1400:
+        rgb.thumbnail((1400, 1400), Image.LANCZOS)
+    arr = np.array(rgb)
+    mask = _mask_simple(arr, tol) if mode == "simple" else _mask_grabcut(arr)
+    if shrink > 0:
+        mask = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=int(shrink))
+    mask = cv2.GaussianBlur(mask, (0, 0), 1.2)
+    rgba = rgb.convert("RGBA")
+    rgba.putalpha(Image.fromarray(mask))
+    return rgba, float(mask.mean() / 255.0)
+
+
+# ---------- naam / date ki patti ----------
+def _font(size):
+    for path in ("DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "LiberationSans-Bold.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def make_passport_caption(img, w_mm, h_mm, zoom, off_x, off_y, bg, lines, inside=True, dpi=300):
+    """Photo ke niche safed patti par naam aur date likho."""
+    if not lines:
+        return make_passport(img, w_mm, h_mm, zoom, off_x, off_y, bg, dpi)
+    n = len(lines)
+    W, H = round(w_mm / 25.4 * dpi), round(h_mm / 25.4 * dpi)
+    strip = round(H * (0.085 * n + 0.03))
+    if inside:
+        photo = make_passport(img, w_mm, h_mm * (H - strip) / H, zoom, off_x, off_y, bg, dpi)
+    else:
+        photo = make_passport(img, w_mm, h_mm, zoom, off_x, off_y, bg, dpi)
+    strip = (H - photo.height) if inside else strip
+    canvas = Image.new("RGB", (photo.width, photo.height + strip), "white")
+    canvas.paste(photo, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    line_h = strip / n
+    for i, text in enumerate(lines):
+        size = max(8, int(line_h * 0.72))
+        font = _font(size)
+        while size > 8 and draw.textbbox((0, 0), text, font=font)[2] > canvas.width - 12:
+            size -= 2
+            font = _font(size)
+        box = draw.textbbox((0, 0), text, font=font)
+        x = (canvas.width - (box[2] - box[0])) // 2 - box[0]
+        y = photo.height + int(i * line_h + (line_h - (box[3] - box[1])) / 2) - box[1]
+        draw.text((x, y), text, fill="black", font=font)
+    return canvas
 
 
 def _jpg(im, dpi=300, q=95):
@@ -1023,22 +1234,45 @@ def ui_word():
             ui_pdf_to_word()
 
 
+cached_cutout = st.cache_data(show_spinner="Background hata rahe hain...")(cutout_from_bytes)
+
+
+@st.cache_resource(show_spinner="AI model load ho raha hai (pehli baar thoda time lagta hai)...")
+def _ai_session(model):
+    from rembg import new_session
+    return new_session(model)
+
+
+@st.cache_data(show_spinner="Background hata raha hu...", max_entries=6)
+def cut_cached(data, method, tol, model):
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    img.load()
+    img.thumbnail((3000, 3000))
+    if method == "ai":
+        return cutout_ai(img, _ai_session(model))
+    return cutout_simple(img, tol)
+
+
 def ui_passport():
-    st.markdown('<div class="hint">Photo upload kijiye, size aur rang chuniye. Photo katkar sahi size me aayegi aur print ke liye sheet bhi banegi.</div>',
+    st.markdown('<div class="hint">Photo upload kijiye. Background badal sakte hain, neeche naam aur date likh sakte hain, aur print sheet bana sakte hain.</div>',
                 unsafe_allow_html=True)
     up = st.file_uploader("Photo chuniye", type=["jpg", "jpeg", "png", "webp"], key="up_f")
     if up is None:
         return
+    data = up.getvalue()
     try:
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(up.getvalue())))
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
         img.load()
+        img.thumbnail((3000, 3000))
     except Exception as e:
         st.error(f"Photo khul nahi payi: {e}")
         return
 
+    # ---- 1. size aur background ----
+    st.markdown("**1. Size aur background**")
     c1, c2 = st.columns(2)
     preset = c1.selectbox("Photo ka size", list(PHOTO_SIZES), key="size_f")
-    bgname = c2.selectbox("Background rang", list(PHOTO_BG), key="bg_f")
+    bgname = c2.selectbox("Naya background rang", list(PHOTO_BG), key="bg_f")
     dims = PHOTO_SIZES[preset]
     if dims is None:
         d1, d2 = st.columns(2)
@@ -1046,17 +1280,67 @@ def ui_passport():
                 d2.number_input("Lambai (mm)", 10.0, 200.0, 45.0, 1.0, key="h_f"))
     bg = PHOTO_BG[bgname] or st.color_picker("Rang chuniye", "#FFFFFF", key="bgc_f")
 
-    st.caption("Chehra frame me beech me aaye, isliye zoom aur position se adjust kijiye. Zoom 1 se kam karne par kinare chune hue rang se bhar jate hain.")
+    change_bg = st.checkbox("Purana background hatakar naya rang lagao", key="chbg_f")
+    work = img
+    if change_bg:
+        opts = ["Simple (ek rang ka saaf background)"] + (["AI (kisi bhi background par)"] if HAS_REMBG else [])
+        method = st.radio("Background kaise hataye?", opts, key="method_f")
+        use_ai = method.startswith("AI")
+        tol, model = 60, "silueta"
+        if use_ai:
+            model = AI_MODELS[st.selectbox("AI model", list(AI_MODELS), key="model_f")]
+        else:
+            tol = st.slider("Kitna background hataye", 10, 150, 60, 5, key="tol_f",
+                            help="Kinare kate-phate ya background bacha ho to badlaiye. Kam = kam hatata hai, zyada = zyada hatata hai.")
+            if not HAS_REMBG:
+                st.caption("Ye tareeka tab best hai jab photo ka background ek hi rang ka ho (deewar ya parda). "
+                           "Kisi bhi background ke liye AI option chahiye, jiske liye `rembg` aur `onnxruntime` requirements.txt me jodne padte hain.")
+        try:
+            work, frac = cut_cached(data, "ai" if use_ai else "simple", tol, model)
+            if frac < 0.03:
+                st.warning("Background pehchana nahi gaya. 'Kitna background hataye' badhaiye.")
+            elif frac > 0.9:
+                st.warning("Bahut zyada hat gaya (chehra bhi). 'Kitna background hataye' kam kijiye.")
+        except Exception as e:
+            st.error(f"Background nahi hat paya: {e}")
+            work = img
+
+    # ---- 2. naam aur date ----
+    st.markdown("**2. Photo ke neeche naam aur date**")
+    want_text = st.checkbox("Photo ke neeche naam / date likhni hai", key="txt_f")
+    lines, mode, strip_mm = [], "inside", 7.0
+    if want_text:
+        name = st.text_input("Naam", key="name_f", placeholder="jaise RAHUL KUMAR")
+        t1, t2 = st.columns(2)
+        want_date = t1.checkbox("Date likhni hai", value=True, key="wd_f")
+        upper = t2.checkbox("Naam CAPITAL letters me", value=True, key="up2_f")
+        if upper:
+            name = name.upper()
+        if name.strip():
+            lines.append(name.strip())
+        if want_date:
+            d = st.date_input("Date", value=datetime.date.today(), format="DD/MM/YYYY", key="date_f")
+            lines.append(d.strftime("%d-%m-%Y"))
+        mode_label = st.radio("Strip kahan rakhein?", ["Photo ke andar (size same rahega)", "Photo ke neeche alag se (photo thodi lambi hogi)"],
+                              key="mode_f")
+        mode = "inside" if mode_label.startswith("Photo ke andar") else "below"
+        strip_mm = st.slider("Strip ki unchai (mm)", 4.0, 12.0, 7.0, 0.5, key="strip_f")
+        st.caption("Naam English (Roman) letters me likhna best hai.")
+
+    # ---- 3. chehra set karo ----
+    st.markdown("**3. Chehra frame me set karo**")
+    st.caption("Chehra beech me aaye, isliye zoom aur position se adjust kijiye. Zoom 1 se kam karne par kinare naye rang se bhar jate hain.")
     zoom = st.slider("Zoom", 0.5, 3.0, 1.0, 0.05, key="zoom_f")
     s1, s2 = st.columns(2)
     off_x = s1.slider("Left / Right", -100, 100, 0, key="ox_f")
     off_y = s2.slider("Upar / Neeche", -100, 100, 0, key="oy_f")
 
-    photo = make_passport(img, dims[0], dims[1], zoom, off_x, off_y, bg)
+    photo = make_passport(work, dims[0], dims[1], zoom, off_x, off_y, bg, lines=lines, mode=mode, strip_mm=strip_mm)
     st.image(photo, width=min(300, photo.width // 2),
-             caption=f"{dims[0]:g} × {dims[1]:g} mm  ({photo.width} × {photo.height} px, 300 dpi)")
+             caption=f"{photo.width / 300 * 25.4:.0f} × {photo.height / 300 * 25.4:.0f} mm  ({photo.width} × {photo.height} px, 300 dpi)")
 
-    st.markdown("**Print sheet**")
+    # ---- 4. print sheet ----
+    st.markdown("**4. Print sheet**")
     p1, p2 = st.columns(2)
     paper = p1.selectbox("Paper", list(PAPERS), key="paper_f")
     guides = p2.checkbox("Katne ke liye line", value=True, key="guides_f")
@@ -1094,7 +1378,7 @@ TOOLS = [
     {"id": "convert", "name": "Format badlo", "badge": "JPG<br>PNG", "color": "var(--teal)", "fn": ui_convert,
      "desc": "Image aur PDF ko ek dusre me badlo"},
     {"id": "photo", "name": "Passport photo", "badge": "35×<br>45", "color": "var(--amber)", "fn": ui_passport,
-     "desc": "Photo sahi size me katkar print sheet banao"},
+     "desc": "Background badlo, naam-date lagao, print sheet banao"},
 ]
 TOOL_BY_ID = {t["id"]: t for t in TOOLS}
 
