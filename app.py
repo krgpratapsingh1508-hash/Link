@@ -728,16 +728,21 @@ html, body, .stApp, [class*="css"]{ font-family:'Hind','Noto Sans Devanagari',sa
           letter-spacing:-.8px; margin:0 0 .65rem 0; padding:0; max-width:680px; text-wrap:balance; }
 .hero p{ font-size:1.07rem; line-height:1.5; color:var(--muted); max-width:520px; margin:0; }
 
-/* tool tiles (poora tile clickable) */
-[class*="st-key-tile_"]{ position:relative; gap:0 !important; margin-bottom:.15rem; }
-[class*="st-key-tile_"] .stButton{ position:absolute; inset:0; z-index:3; width:100%; height:100%; }
-[class*="st-key-tile_"] .stButton > button{ width:100%; height:100%; opacity:0; cursor:pointer; border:0; background:transparent; }
-.tile{ display:flex; align-items:center; gap:1rem; background:var(--card); border:1px solid var(--line);
-       border-radius:14px; padding:1rem 1.1rem; min-height:94px; border-left:5px solid var(--c); }
+/* tool tiles: upar jaankari, neeche rang wala "Kholo" button */
+[class*="st-key-tile_"]{ gap:0 !important; margin-bottom:.4rem; }
+.tile{ display:flex; align-items:center; gap:1rem; background:var(--card); border:1px solid var(--line); border-bottom:0;
+       border-radius:14px 14px 0 0; padding:1rem 1.1rem; min-height:94px; border-left:5px solid var(--c); }
 .tile b{ display:block; font-family:'Bricolage Grotesque',sans-serif; font-weight:600; font-size:1.14rem; line-height:1.2; }
 .tile .d{ display:block; margin-top:.2rem; color:var(--muted); font-size:.93rem; line-height:1.35; }
-[class*="st-key-tile_"]:hover .tile{ border-color:var(--c); background:#FBFCFE; }
-[class*="st-key-tile_"]:focus-within .tile{ outline:2px solid var(--ink); outline-offset:2px; }
+[class*="st-key-open_"] .stButton, [class*="st-key-open_"] .stButton > button{ width:100%; }
+[class*="st-key-open_"] .stButton > button{ border:0; border-radius:0 0 14px 14px; color:#fff; font-weight:600; min-height:2.6rem; }
+[class*="st-key-open_"] .stButton > button:hover{ filter:brightness(.88); color:#fff; }
+.st-key-open_excel button{ background:var(--xl) !important; }
+.st-key-open_word button{ background:var(--wd) !important; }
+.st-key-open_pdf button{ background:var(--pdf) !important; }
+.st-key-open_size button{ background:var(--ink) !important; }
+.st-key-open_convert button{ background:var(--teal) !important; }
+.st-key-open_photo button{ background:var(--amber) !important; }
 
 /* tool page */
 .st-key-back button{ background:none; border:0; color:var(--muted); padding:0; min-height:0; font-weight:600; }
@@ -1133,7 +1138,7 @@ def show_home():
                         f'<div><b>{t["name"]}</b><span class="d">{t["desc"]}</span></div></div>',
                         unsafe_allow_html=True,
                     )
-                    st.button(f"{t['name']} kholo", key=f"tilebtn_{t['id']}", on_click=open_tool, args=(t["id"],))
+                    st.button("Kholo", key=f"open_{t['id']}", on_click=open_tool, args=(t["id"],))
 
 
 def show_tool(t):
