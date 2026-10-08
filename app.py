@@ -289,22 +289,93 @@ def convert_and_offer(pdfs, status, zip_name):
                            file_name=zip_name, mime="application/zip")
 
 
-st.set_page_config(page_title="Notice to Excel", page_icon="📄")
-st.title("📄 KRG Notice → Excel")
+st.set_page_config(page_title="Notice se Excel aur Word", page_icon="📄", layout="centered")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🔗 Links → Excel", "📤 PDF → Excel",
-    "📝 Links → Word", "📝 PDF → Word", "📋 Table → Word",
-])
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Hind:wght@400;500;600&display=swap');
 
-with tab1:
-    links_text = st.text_area(
-        "Notice links (har line me ek link, 10 ya zyada bhi chalenge)",
-        value=DEFAULT_URL,
-        height=200,
-    )
-    if st.button("Excel banao", type="primary"):
-        urls = [u.strip() for u in links_text.splitlines() if u.strip()]
+:root{
+  --ink:#14213D; --muted:#5B6678; --paper:#F4F6F9; --card:#FFFFFF; --line:#D9DFE8;
+  --xl:#1D6F42; --xl-soft:#E4F2EA; --wd:#2B579A; --wd-soft:#E5ECF8;
+}
+html, body, .stApp, [class*="css"]{ font-family:'Hind','Noto Sans Devanagari',sans-serif; color:var(--ink); }
+.stApp{ background:var(--paper); }
+.block-container{ max-width:760px; padding-top:2rem; padding-bottom:4rem; }
+#MainMenu, footer{ visibility:hidden; }
+
+/* hero */
+.hero{ margin:0 0 1.6rem 0; }
+.hero .files{ position:relative; height:84px; margin-bottom:.6rem; }
+.ft{ position:absolute; top:0; width:56px; height:68px; display:flex; align-items:flex-end;
+     padding:0 0 7px 8px; color:#fff; font:600 .82rem 'Hind',sans-serif; letter-spacing:.2px;
+     clip-path:polygon(0 0,68% 0,100% 24%,100% 100%,0 100%); border-radius:3px; }
+.ft.xl{ left:8px; top:6px; background:var(--xl); transform:rotate(-5deg); }
+.ft.wd{ left:56px; top:10px; background:var(--wd); transform:rotate(4deg); }
+.hero h1{ font-family:'Bricolage Grotesque',sans-serif; font-weight:800; font-size:2.35rem;
+          line-height:1.08; letter-spacing:-.8px; margin:0 0 .6rem 0; padding:0; max-width:560px; }
+.hero p{ font-size:1.06rem; line-height:1.5; color:var(--muted); max-width:520px; margin:0; }
+
+/* tabs: Excel hara, Word neela */
+.stTabs [data-baseweb="tab-list"]{ gap:0; border-bottom:1px solid var(--line); }
+.stTabs [data-baseweb="tab"]{ padding:.7rem 1.3rem; font-weight:600; font-size:1.02rem; color:var(--muted); }
+.stTabs [data-baseweb="tab"][aria-selected="true"]{ color:var(--ink); }
+.stTabs:has([data-baseweb="tab"]:nth-child(1)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--xl); height:3px; }
+.stTabs:has([data-baseweb="tab"]:nth-child(2)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--wd); height:3px; }
+
+/* inputs */
+.stTextArea textarea{ background:var(--card); border:1px solid var(--line); border-radius:10px;
+     font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.84rem; line-height:1.55; }
+.stTextArea textarea:focus{ border-color:var(--ink); box-shadow:0 0 0 2px rgba(20,33,61,.12); }
+[data-testid="stFileUploaderDropzone"]{ background:var(--card); border:1.5px dashed #9AA7BD; border-radius:12px; }
+div[role="radiogroup"]{ gap:.5rem; margin-bottom:.4rem; }
+
+/* buttons */
+.stButton > button, .stDownloadButton > button{ border-radius:10px; font-weight:600; padding:.55rem 1.3rem; min-height:2.8rem; }
+[class*="st-key-go_x"] button{ background:var(--xl); border:1px solid var(--xl); color:#fff; }
+[class*="st-key-go_x"] button:hover{ background:#175a36; border-color:#175a36; color:#fff; }
+[class*="st-key-go_w"] button{ background:var(--wd); border:1px solid var(--wd); color:#fff; }
+[class*="st-key-go_w"] button:hover{ background:#22457b; border-color:#22457b; color:#fff; }
+.stDownloadButton > button{ background:var(--card); border:1.5px solid var(--ink); color:var(--ink); }
+.stDownloadButton > button:hover{ background:var(--ink); color:#fff; border-color:var(--ink); }
+
+/* results */
+[data-testid="stDataFrame"]{ border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+[data-testid="stAlert"]{ border-radius:10px; }
+h3{ font-family:'Bricolage Grotesque',sans-serif; font-weight:600; letter-spacing:-.2px; }
+.hint{ color:var(--muted); font-size:.95rem; margin:.1rem 0 .9rem 0; }
+
+@media (max-width:640px){
+  .hero h1{ font-size:1.85rem; }
+  .stTabs [data-baseweb="tab"]{ flex:1; justify-content:center; padding:.7rem .4rem; }
+}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown(
+    """
+<div class="hero">
+  <div class="files"><span class="ft xl">.xlsx</span><span class="ft wd">.docx</span></div>
+  <h1>Notice ki roll list, seedha Excel ya Word me</h1>
+  <p>Notice ka link ya PDF do. Table nikalkar download ke liye file taiyar ho jayegi.</p>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+SRC = ["Notice links", "PDF upload"]
+LINKS_LABEL = "Notice links"
+LINKS_HINT = '<div class="hint">Har line me ek link. 10 ya usse zyada bhi daal sakte hain.</div>'
+
+
+def ui_links_to_excel():
+    st.markdown(LINKS_HINT, unsafe_allow_html=True)
+    links = st.text_area(LINKS_LABEL, value=DEFAULT_URL, height=200, key="links_x", label_visibility="collapsed")
+    if st.button("Excel banao", key="go_x_links"):
+        urls = [u.strip() for u in links.splitlines() if u.strip()]
+        if not urls:
+            st.error("Pehle kam se kam ek notice link daaliye.")
+            return
         frames, status_rows = [], []
         bar = st.progress(0.0)
         for i, u in enumerate(urls, 1):
@@ -324,9 +395,10 @@ with tab1:
             bar.progress(i / len(urls))
         show_result(frames, status_rows)
 
-with tab2:
-    ups = st.file_uploader("Roll list PDF upload kijiye (ek ya zyada)", type=["pdf"], accept_multiple_files=True)
-    if ups and st.button("PDF se Excel banao", type="primary"):
+
+def ui_pdf_to_excel():
+    ups = st.file_uploader("PDF chuniye (ek ya zyada)", type=["pdf"], accept_multiple_files=True, key="up_x")
+    if ups and st.button("Excel banao", key="go_x_pdf"):
         frames, status_rows = [], []
         for up in ups:
             title = up.name.rsplit(".", 1)[0]
@@ -341,33 +413,45 @@ with tab2:
             status_rows.append(row)
         show_result(frames, status_rows)
 
-with tab3:
-    st.write("Notice links se PDF lekar **Word (.docx)** banao (PDF jaisa layout).")
-    links3 = st.text_area("Notice links (har line me ek)", value=DEFAULT_URL, height=200, key="links3")
-    if st.button("Word banao", type="primary", key="btn3"):
-        pdfs, status = download_pdfs_from_links(links3)
+
+def ui_links_to_word():
+    st.markdown(LINKS_HINT, unsafe_allow_html=True)
+    links = st.text_area(LINKS_LABEL, value=DEFAULT_URL, height=200, key="links_w", label_visibility="collapsed")
+    if st.button("Word banao", key="go_w_links"):
+        if not links.strip():
+            st.error("Pehle kam se kam ek notice link daaliye.")
+            return
+        pdfs, status = download_pdfs_from_links(links)
         with st.spinner("Word me convert ho raha hai..."):
             convert_and_offer(pdfs, status, "notices_word.zip")
 
-with tab4:
-    st.write("PDF upload karke **Word (.docx)** banao (PDF jaisa layout).")
-    ups4 = st.file_uploader("PDF upload kijiye (ek ya zyada)", type=["pdf"], accept_multiple_files=True, key="up4")
-    if ups4 and st.button("PDF se Word banao", type="primary", key="btn4"):
-        pdfs = [(u.name.rsplit(".", 1)[0], u.read()) for u in ups4]
+
+def ui_pdf_to_word():
+    ups = st.file_uploader("PDF chuniye (ek ya zyada)", type=["pdf"], accept_multiple_files=True, key="up_w")
+    if ups and st.button("Word banao", key="go_w_pdf"):
+        pdfs = [(u.name.rsplit(".", 1)[0], u.read()) for u in ups]
         status = [{"Link": t, "Title": t, "Result": ""} for t, _ in pdfs]
         with st.spinner("Word me convert ho raha hai..."):
             convert_and_offer(pdfs, status, "pdf_to_word.zip")
 
-with tab5:
-    st.write("Roll list ki **table** ko saaf Word table me badlo. Saare notice **ek hi Word file** me, har notice alag page par, title heading ke saath.")
-    links5 = st.text_area("Notice links (har line me ek, optional)", value="", height=150, key="links5")
-    ups5 = st.file_uploader("Ya PDF upload kijiye", type=["pdf"], accept_multiple_files=True, key="up5")
-    if st.button("Table Word me banao", type="primary", key="btn5"):
+
+def ui_table_to_word():
+    st.markdown(
+        '<div class="hint">Saare notice ek hi Word file me aayenge. Har notice naye page par, apne title ke saath.</div>',
+        unsafe_allow_html=True,
+    )
+    links = st.text_area(LINKS_LABEL, value="", height=130, key="links_t", label_visibility="collapsed",
+                         placeholder="Notice links yahan daaliye (har line me ek)")
+    ups = st.file_uploader("Ya PDF chuniye", type=["pdf"], accept_multiple_files=True, key="up_t")
+    if st.button("Word banao", key="go_w_table"):
         items, status = [], []
-        if links5.strip():
-            pdfs, status = download_pdfs_from_links(links5)
+        if links.strip():
+            pdfs, status = download_pdfs_from_links(links)
             items += pdfs
-        items += [(u.name.rsplit(".", 1)[0], u.read()) for u in (ups5 or [])]
+        items += [(u.name.rsplit(".", 1)[0], u.read()) for u in (ups or [])]
+        if not items:
+            st.error("Link daaliye ya PDF chuniye.")
+            return
         results = []
         for title, data in items:
             try:
@@ -377,12 +461,33 @@ with tab5:
         if status:
             st.dataframe(pd.DataFrame(status), use_container_width=True)
         if results:
-            st.success(f"{len(results)} notice ki table taiyar")
+            st.success(f"{len(results)} notice ki table taiyar hai")
             st.download_button(
-                "⬇️ Word download karo",
+                "Word download karo",
                 data=tables_to_docx_bytes(results),
                 file_name="notices_tables.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         else:
-            st.error("Koi table nahi mili.")
+            st.error("Kisi bhi notice se table nahi mili.")
+
+
+tab_x, tab_w = st.tabs(["Excel banao", "Word banao"])
+
+with tab_x:
+    src = st.radio("Data kahan se aayega?", SRC, horizontal=True, key="src_x")
+    if src == SRC[0]:
+        ui_links_to_excel()
+    else:
+        ui_pdf_to_excel()
+
+with tab_w:
+    kind = st.radio("Word kaisa chahiye?", ["PDF jaisa layout", "Saaf table"], horizontal=True, key="kind_w")
+    if kind == "Saaf table":
+        ui_table_to_word()
+    else:
+        src_w = st.radio("Data kahan se aayega?", SRC, horizontal=True, key="src_w")
+        if src_w == SRC[0]:
+            ui_links_to_word()
+        else:
+            ui_pdf_to_word()
