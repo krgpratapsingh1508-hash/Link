@@ -6,3 +6,6 @@ pandas
 openpyxl
 pdf2docx
 python-docx
+Pillow
+PyMuPDF
+pypdfium2
