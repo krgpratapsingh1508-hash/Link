@@ -3,11 +3,14 @@ import os
 import re
 import tempfile
 import traceback
+import struct
 import zipfile
+import zlib
 from urllib.parse import urljoin
 
 import pandas as pd
 import requests
+from PIL import Image
 import streamlit as st
 from bs4 import BeautifulSoup
 
@@ -28,6 +31,20 @@ try:
 except Exception as e:
     Document = None
     DOCX_ERROR = str(e)
+
+try:
+    import pymupdf as fitz
+except Exception:
+    try:
+        import fitz
+    except Exception:
+        fitz = None
+
+try:
+    import pypdfium2 as pdfium
+except Exception as e:
+    pdfium = None
+    PDFIUM_ERROR = str(e)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -289,6 +306,310 @@ def convert_and_offer(pdfs, status, zip_name):
                            file_name=zip_name, mime="application/zip")
 
 
+
+# ======================= SIZE BADLO / FORMAT BADLO =======================
+UNITS = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}
+MAX_PAD = 200 * 1024 ** 2  # size badhane ki seema (server memory ke liye)
+MIME = {
+    "pdf": "application/pdf", "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+    "webp": "image/webp", "bmp": "image/bmp", "tiff": "image/tiff", "zip": "application/zip",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def human(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.2f} {u}"
+        n /= 1024
+
+
+def _open_img(data):
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    return im
+
+
+def _flatten(im):
+    """Transparent image ko safed background par RGB banao (JPG/BMP ke liye)."""
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[3])
+        return bg
+    return im.convert("RGB")
+
+
+def _jpeg_bytes(im, q):
+    b = io.BytesIO()
+    im.save(b, "JPEG", quality=q, optimize=True)
+    return b.getvalue()
+
+
+def _png_bytes(im, quantize=False):
+    b = io.BytesIO()
+    if quantize:
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA").quantize(colors=256, method=Image.Quantize.FASTOCTREE)
+        else:
+            im = im.convert("RGB").quantize(colors=256)
+    im.save(b, "PNG", optimize=True)
+    return b.getvalue()
+
+
+def _scaled(im, scale):
+    if scale == 1.0:
+        return im
+    return im.resize((max(1, int(im.width * scale)), max(1, int(im.height * scale))), Image.LANCZOS)
+
+
+def shrink_image(data, fmt, target):
+    im = _open_img(data)
+    scale = 1.0
+    if fmt == "JPEG":
+        base = _flatten(im)
+        while True:
+            cur = _scaled(base, scale)
+            lo, hi, best = 5, 95, None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                out = _jpeg_bytes(cur, mid)
+                if len(out) <= target:
+                    best, lo = out, mid + 1
+                else:
+                    hi = mid - 1
+            if best:
+                return best
+            scale *= 0.85
+            if min(base.width, base.height) * scale < 24:
+                return _jpeg_bytes(cur, 5)
+    while True:  # PNG
+        cur = _scaled(im, scale)
+        out = _png_bytes(cur, False)
+        if len(out) <= target:
+            return out
+        out = _png_bytes(cur, True)
+        if len(out) <= target:
+            return out
+        scale *= 0.9
+        if min(im.width, im.height) * scale < 24:
+            return out
+
+
+def pad_jpeg(data, extra):
+    pos = 2
+    if data[2:4] == b"\xff\xe0":  # JFIF APP0 ke baad comment jodo
+        pos = 4 + struct.unpack(">H", data[4:6])[0]
+    segs, remaining = bytearray(), extra
+    while remaining >= 5:
+        p = min(65533, remaining - 4)
+        segs += b"\xff\xfe" + struct.pack(">H", p + 2) + bytes(p)
+        remaining -= p + 4
+    return data[:pos] + bytes(segs) + data[pos:] + bytes(remaining)
+
+
+def pad_png(data, extra):
+    if extra < 20 or data[-12:-8] != b"\x00\x00\x00\x00" or data[-8:-4] != b"IEND":
+        return data + bytes(extra)
+    payload = b"Padding\x00" + bytes(extra - 12 - 8)
+    chunk = struct.pack(">I", len(payload)) + b"tEXt" + payload
+    chunk += struct.pack(">I", zlib.crc32(b"tEXt" + payload) & 0xFFFFFFFF)
+    return data[:-12] + chunk + data[-12:]
+
+
+def pad_pdf(data, extra):
+    if fitz is not None and extra > 4000:
+        try:
+            doc = fitz.open(stream=data, filetype="pdf")
+            doc.embfile_add("padding.bin", os.urandom(extra - 3000))
+            out = doc.tobytes()
+            doc.close()
+            if len(out) <= len(data) + extra:
+                return out + b"\n%" + b"0" * (len(data) + extra - len(out) - 2) if len(data) + extra - len(out) > 2 else out
+        except Exception:
+            pass
+    return data + b"\n%" + b"0" * (extra - 2) if extra > 2 else data + bytes(extra)
+
+
+def _zip_rebuild(data, media_fn=None):
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
+        for item in zin.infolist():
+            b = zin.read(item.filename)
+            low = item.filename.lower()
+            if media_fn and "/media/" in low and low.endswith((".jpg", ".jpeg", ".png")):
+                try:
+                    b = media_fn(low, b)
+                except Exception:
+                    pass
+            zout.writestr(item.filename, b)
+    return buf.getvalue()
+
+
+def _recompress_media(name, b, scale, q):
+    im = _open_img(b)
+    cur = _scaled(im, scale)
+    if name.endswith(".png"):
+        out = _png_bytes(cur, quantize=(scale < 1 or q < 60))
+    else:
+        out = _jpeg_bytes(_flatten(cur), q)
+    return out if len(out) < len(b) else b
+
+
+def shrink_office(data, target):
+    best = _zip_rebuild(data)
+    if len(best) <= target:
+        return best, "Lossless compress"
+    for scale, q in [(1, 85), (1, 70), (.8, 60), (.7, 50), (.6, 40), (.5, 30), (.4, 25), (.3, 20)]:
+        out = _zip_rebuild(data, lambda n, b: _recompress_media(n, b, scale, q))
+        if len(out) < len(best):
+            best = out
+        if len(out) <= target:
+            return out, f"Andar ki images compress ki (quality {q}, size {int(scale * 100)}%)"
+    return best, "images compress karne ke baad bhi target tak nahi pahunch paya"
+
+
+def pad_office(data, extra):
+    zin = zipfile.ZipFile(io.BytesIO(data))
+
+    def build(pad_len):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
+            for item in zin.infolist():
+                b = zin.read(item.filename)
+                if item.filename == "[Content_Types].xml" and b'Extension="bin"' not in b and b"<Default " in b:
+                    b = b.replace(b"<Default ", b'<Default Extension="bin" ContentType="application/octet-stream"/><Default ', 1)
+                zout.writestr(item.filename, b)
+            if pad_len is not None:
+                zi = zipfile.ZipInfo("customXml/padding.bin")
+                zi.compress_type = zipfile.ZIP_STORED
+                zout.writestr(zi, bytes(pad_len))
+        return buf.getvalue()
+
+    target = len(data) + extra
+    s0, s1 = len(build(None)), len(build(1))
+    header = s1 - s0 - 1
+    pad_len = max(target - s0 - header, 0)
+    return build(pad_len)
+
+
+def shrink_pdf(data, target):
+    best, note = data, ""
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=data, filetype="pdf")
+            out = doc.tobytes(garbage=4, deflate=True, clean=True)
+            doc.close()
+            if len(out) <= target:
+                return out, "Lossless compress (text jaisa ka taisa)"
+            if len(out) < len(best):
+                best = out
+        except Exception:
+            pass
+    if pdfium is None:
+        return best, f"pypdfium2 nahi hai: {PDFIUM_ERROR}"
+    pdf = pdfium.PdfDocument(data)
+    base = [pdf[i].render(scale=150 / 72).to_pil().convert("RGB") for i in range(len(pdf))]
+    for dpi, q in [(150, 75), (120, 60), (100, 50), (80, 40), (60, 30), (50, 25)]:
+        imgs = [_scaled(im, dpi / 150) for im in base]
+        buf = io.BytesIO()
+        imgs[0].save(buf, "PDF", save_all=True, append_images=imgs[1:], quality=q, resolution=dpi)
+        out = buf.getvalue()
+        if len(out) < len(best):
+            best = out
+        if len(out) <= target:
+            return out, f"Pages image me badal kar compress kiya ({dpi} dpi, quality {q}). Ab text select/copy nahi hoga."
+    return best, "bahut compress karne ke baad bhi target tak nahi pahunch paya"
+
+
+def resize_file(name, data, target):
+    """File ko target bytes ke paas laao. Return: (new_bytes, note)"""
+    ext = name.rsplit(".", 1)[-1].lower()
+    cur = len(data)
+    if abs(target - cur) <= 16:
+        return data, "Size pehle se hi itna hai"
+    if target > cur:
+        extra = target - cur
+        if extra > MAX_PAD:
+            raise RuntimeError(f"Size badhane ki seema {human(MAX_PAD)} hai")
+        if ext in ("jpg", "jpeg"):
+            return pad_jpeg(data, extra), "Size badhaya (extra bytes jode, quality same)"
+        if ext == "png":
+            return pad_png(data, extra), "Size badhaya (extra bytes jode, quality same)"
+        if ext == "pdf":
+            return pad_pdf(data, extra), "Size badhaya (extra bytes jode, content same)"
+        if ext in ("docx", "xlsx"):
+            return pad_office(data, extra), "Size badhaya (extra data jodkar, content same)"
+        raise RuntimeError("Ye file type support nahi hai")
+    if ext in ("jpg", "jpeg"):
+        return shrink_image(data, "JPEG", target), "Compress kiya"
+    if ext == "png":
+        return shrink_image(data, "PNG", target), "Compress kiya"
+    if ext == "pdf":
+        return shrink_pdf(data, target)
+    if ext in ("docx", "xlsx"):
+        return shrink_office(data, target)
+    raise RuntimeError("Ye file type support nahi hai")
+
+
+IMG_FORMATS = {"JPG": ("JPEG", "jpg"), "PNG": ("PNG", "png"), "WEBP": ("WEBP", "webp"),
+               "BMP": ("BMP", "bmp"), "TIFF": ("TIFF", "tiff")}
+
+
+def convert_image(data, key):
+    fmt, _ = IMG_FORMATS[key]
+    im = _open_img(data)
+    if fmt in ("JPEG", "BMP"):
+        im = _flatten(im)
+    elif im.mode not in ("RGB", "RGBA", "L", "P"):
+        im = im.convert("RGBA")
+    buf = io.BytesIO()
+    kw = {"quality": 95} if fmt in ("JPEG", "WEBP") else {}
+    if fmt in ("JPEG", "PNG"):
+        kw["optimize"] = True
+    im.save(buf, fmt, **kw)
+    return buf.getvalue()
+
+
+def images_to_pdf(images_bytes):
+    imgs = [_flatten(_open_img(b)) for b in images_bytes]
+    buf = io.BytesIO()
+    imgs[0].save(buf, "PDF", save_all=True, append_images=imgs[1:], resolution=100)
+    return buf.getvalue()
+
+
+def pdf_to_images(pdf_bytes, key, dpi):
+    if pdfium is None:
+        raise RuntimeError(f"pypdfium2 install nahi hai: {PDFIUM_ERROR}")
+    fmt, ext = IMG_FORMATS[key]
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    out = []
+    for i in range(len(pdf)):
+        im = pdf[i].render(scale=dpi / 72).to_pil()
+        im = _flatten(im) if fmt == "JPEG" else im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, fmt, **({"quality": 92} if fmt == "JPEG" else {}))
+        out.append((i + 1, ext, buf.getvalue()))
+    return out
+
+
+def offer_download(files, zip_name, label="Download karo"):
+    """files = [(name, bytes)]. Ek ho to seedha file, zyada ho to ZIP."""
+    if not files:
+        return
+    if len(files) == 1:
+        name, data = files[0]
+        st.download_button(label, data=data, file_name=name,
+                           mime=MIME.get(name.rsplit(".", 1)[-1].lower(), "application/octet-stream"),
+                           key=f"dl_{zip_name}_{name}")
+    else:
+        st.download_button(f"{label} (ZIP, {len(files)} files)", data=make_zip(files), file_name=zip_name,
+                           mime="application/zip", key=f"dl_{zip_name}")
+
+
 st.set_page_config(page_title="Notice se Excel aur Word", page_icon="📄", layout="centered")
 
 CSS = """
@@ -297,7 +618,7 @@ CSS = """
 
 :root{
   --ink:#14213D; --muted:#5B6678; --paper:#F4F6F9; --card:#FFFFFF; --line:#D9DFE8;
-  --xl:#1D6F42; --xl-soft:#E4F2EA; --wd:#2B579A; --wd-soft:#E5ECF8;
+  --xl:#1D6F42; --xl-soft:#E4F2EA; --wd:#2B579A; --wd-soft:#E5ECF8; --pdf:#B3261E;
 }
 html, body, .stApp, [class*="css"]{ font-family:'Hind','Noto Sans Devanagari',sans-serif; color:var(--ink); }
 .stApp{ background:var(--paper); }
@@ -322,6 +643,10 @@ html, body, .stApp, [class*="css"]{ font-family:'Hind','Noto Sans Devanagari',sa
 .stTabs [data-baseweb="tab"][aria-selected="true"]{ color:var(--ink); }
 .stTabs:has([data-baseweb="tab"]:nth-child(1)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--xl); height:3px; }
 .stTabs:has([data-baseweb="tab"]:nth-child(2)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--wd); height:3px; }
+.stTabs:has([data-baseweb="tab"]:nth-child(3)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--pdf); height:3px; }
+.stTabs:has([data-baseweb="tab"]:nth-child(n+4)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--ink); height:3px; }
+.stTabs [data-baseweb="tab-list"]{ overflow-x:auto; }
+.stTabs [data-baseweb="tab"]{ white-space:nowrap; }
 
 /* inputs */
 .stTextArea textarea{ background:var(--card); border:1px solid var(--line); border-radius:10px;
@@ -336,6 +661,10 @@ div[role="radiogroup"]{ gap:.5rem; margin-bottom:.4rem; }
 [class*="st-key-go_x"] button:hover{ background:#175a36; border-color:#175a36; color:#fff; }
 [class*="st-key-go_w"] button{ background:var(--wd); border:1px solid var(--wd); color:#fff; }
 [class*="st-key-go_w"] button:hover{ background:#22457b; border-color:#22457b; color:#fff; }
+[class*="st-key-go_p"] button{ background:var(--pdf); border:1px solid var(--pdf); color:#fff; }
+[class*="st-key-go_p"] button:hover{ background:#8f1e18; border-color:#8f1e18; color:#fff; }
+[class*="st-key-go_s"] button, [class*="st-key-go_c"] button{ background:var(--ink); border:1px solid var(--ink); color:#fff; }
+[class*="st-key-go_s"] button:hover, [class*="st-key-go_c"] button:hover{ background:#0b1428; border-color:#0b1428; color:#fff; }
 .stDownloadButton > button{ background:var(--card); border:1.5px solid var(--ink); color:var(--ink); }
 .stDownloadButton > button:hover{ background:var(--ink); color:#fff; border-color:var(--ink); }
 
@@ -347,7 +676,7 @@ h3{ font-family:'Bricolage Grotesque',sans-serif; font-weight:600; letter-spacin
 
 @media (max-width:640px){
   .hero h1{ font-size:1.85rem; }
-  .stTabs [data-baseweb="tab"]{ flex:1; justify-content:center; padding:.7rem .4rem; }
+  .stTabs [data-baseweb="tab"]{ padding:.7rem .9rem; }
 }
 </style>
 """
@@ -357,7 +686,7 @@ st.markdown(
 <div class="hero">
   <div class="files"><span class="ft xl">.xlsx</span><span class="ft wd">.docx</span></div>
   <h1>Notice ki roll list, seedha Excel ya Word me</h1>
-  <p>Notice ka link ya PDF do. Table nikalkar download ke liye file taiyar ho jayegi.</p>
+  <p>Notice ka link ya PDF do. Excel, Word ya PDF banao, ya kisi bhi file ka size aur format badlo.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -472,7 +801,116 @@ def ui_table_to_word():
             st.error("Kisi bhi notice se table nahi mili.")
 
 
-tab_x, tab_w = st.tabs(["Excel banao", "Word banao"])
+def ui_links_to_pdf():
+    st.markdown(LINKS_HINT, unsafe_allow_html=True)
+    links = st.text_area(LINKS_LABEL, value=DEFAULT_URL, height=200, key="links_p", label_visibility="collapsed")
+    if st.button("PDF nikalo", key="go_p_links"):
+        if not links.strip():
+            st.error("Pehle kam se kam ek notice link daaliye.")
+            return
+        pdfs, status = download_pdfs_from_links(links)
+        files = []
+        for i, (title, data) in enumerate(pdfs, 1):
+            name = safe_name(title, f"notice_{i}") + ".pdf"
+            files.append((name, data))
+        for r in status:
+            if r["Result"] == "PDF mil gayi":
+                r["Result"] = "OK"
+        st.subheader("Status")
+        st.dataframe(pd.DataFrame(status), use_container_width=True)
+        if files:
+            st.success(f"{len(files)} PDF taiyar")
+            offer_download(files, "notice_pdfs.zip", "PDF download karo")
+        else:
+            st.error("Kisi bhi link se PDF nahi mili.")
+
+
+def ui_resize():
+    st.markdown('<div class="hint">PDF, Word (.docx), Excel (.xlsx), JPG, JPEG ya PNG chuniye aur batayiye kitna size chahiye.</div>',
+                unsafe_allow_html=True)
+    ups = st.file_uploader("File chuniye", type=["pdf", "docx", "xlsx", "jpg", "jpeg", "png"],
+                           accept_multiple_files=True, key="up_s")
+    c1, c2 = st.columns([2, 1])
+    val = c1.number_input("Kitna size chahiye", min_value=1.0, value=100.0, step=10.0, key="val_s")
+    unit = c2.selectbox("Unit", list(UNITS), key="unit_s")
+    st.caption(f"Bade se chhota karne par compress hoga. Chhote se bada karne par extra data jodkar size badhega (max {human(MAX_PAD)}).")
+    if ups and st.button("Size badlo", key="go_s"):
+        target = int(val * UNITS[unit])
+        outputs, rows = [], []
+        for up in ups:
+            data = up.read()
+            row = {"File": up.name, "Pehle": human(len(data)), "Ab": "", "Result": ""}
+            try:
+                with st.spinner(f"{up.name} ..."):
+                    new, note = resize_file(up.name, data, target)
+                outputs.append((up.name, new))
+                row["Ab"] = human(len(new))
+                row["Result"] = note
+            except Exception as e:
+                row["Result"] = f"Error: {e}"
+            rows.append(row)
+        st.subheader("Natija")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        offer_download(outputs, "resized_files.zip", "Download karo")
+
+
+def ui_convert():
+    mode = st.radio("Kya badalna hai?", ["Image se Image", "Image se PDF", "PDF se Image"], horizontal=True, key="mode_c")
+    img_types = ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"]
+    if mode == "Image se Image":
+        ups = st.file_uploader("Image chuniye (ek ya zyada)", type=img_types, accept_multiple_files=True, key="up_c1")
+        key = st.selectbox("Kis format me badalna hai?", list(IMG_FORMATS), key="fmt_c1")
+        if ups and st.button("Convert karo", key="go_c1"):
+            outs, rows = [], []
+            for up in ups:
+                row = {"File": up.name, "Result": ""}
+                try:
+                    new = convert_image(up.read(), key)
+                    outs.append((up.name.rsplit(".", 1)[0] + "." + IMG_FORMATS[key][1], new))
+                    row["Result"] = f"OK ({human(len(new))})"
+                except Exception as e:
+                    row["Result"] = f"Error: {e}"
+                rows.append(row)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            offer_download(outs, "converted_images.zip", "Download karo")
+    elif mode == "Image se PDF":
+        ups = st.file_uploader("Images chuniye (jis order me upload karoge, usi order me pages banenge)",
+                               type=img_types, accept_multiple_files=True, key="up_c2")
+        one = st.checkbox("Sab images ko ek hi PDF me jodo", value=True, key="one_c2")
+        if ups and st.button("PDF banao", key="go_c2"):
+            try:
+                blobs = [(u.name, u.read()) for u in ups]
+                if one:
+                    outs = [("images.pdf", images_to_pdf([b for _, b in blobs]))]
+                else:
+                    outs = [(n.rsplit(".", 1)[0] + ".pdf", images_to_pdf([b])) for n, b in blobs]
+                st.success(f"{len(outs)} PDF taiyar")
+                offer_download(outs, "images_pdf.zip", "PDF download karo")
+            except Exception as e:
+                st.error(f"Error: {e}")
+    else:
+        ups = st.file_uploader("PDF chuniye (ek ya zyada)", type=["pdf"], accept_multiple_files=True, key="up_c3")
+        c1, c2 = st.columns(2)
+        key = c1.selectbox("Image format", ["JPG", "PNG"], key="fmt_c3")
+        dpi = c2.selectbox("Quality (dpi)", [100, 150, 200, 300], index=1, key="dpi_c3")
+        if ups and st.button("Images banao", key="go_c3"):
+            outs, rows = [], []
+            for up in ups:
+                row = {"File": up.name, "Pages": 0, "Result": ""}
+                try:
+                    pages = pdf_to_images(up.read(), key, dpi)
+                    base = up.name.rsplit(".", 1)[0]
+                    for n, ext, b in pages:
+                        outs.append((f"{base}_page{n}.{ext}", b))
+                    row["Pages"], row["Result"] = len(pages), "OK"
+                except Exception as e:
+                    row["Result"] = f"Error: {e}"
+                rows.append(row)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            offer_download(outs, "pdf_pages.zip", "Images download karo")
+
+
+tab_x, tab_w, tab_p, tab_s, tab_c = st.tabs(["Excel banao", "Word banao", "Link se PDF", "Size badlo", "Format badlo"])
 
 with tab_x:
     src = st.radio("Data kahan se aayega?", SRC, horizontal=True, key="src_x")
@@ -491,3 +929,12 @@ with tab_w:
             ui_links_to_word()
         else:
             ui_pdf_to_word()
+
+with tab_p:
+    ui_links_to_pdf()
+
+with tab_s:
+    ui_resize()
+
+with tab_c:
+    ui_convert()
