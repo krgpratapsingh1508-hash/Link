@@ -10,7 +10,7 @@ from urllib.parse import urljoin
 
 import pandas as pd
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 import streamlit as st
 from bs4 import BeautifulSoup
 
@@ -610,6 +610,92 @@ def offer_download(files, zip_name, label="Download karo"):
                            mime="application/zip", key=f"dl_{zip_name}")
 
 
+
+# ============================ PASSPORT PHOTO ============================
+PHOTO_SIZES = {
+    "35 × 45 mm (sabse common)": (35, 45),
+    "2 × 2 inch / 51 × 51 mm": (50.8, 50.8),
+    "PAN card 25 × 35 mm": (25, 35),
+    "Stamp size 20 × 25 mm": (20, 25),
+    "33 × 48 mm": (33, 48),
+    "Apna size (mm me)": None,
+}
+PHOTO_BG = {"Safed": "#FFFFFF", "Neela": "#2F6FB5", "Halka grey": "#E6E8EB", "Apna rang": None}
+PAPERS = {"4 × 6 inch": (101.6, 152.4), "5 × 7 inch": (127.0, 177.8), "A4": (210.0, 297.0)}
+
+
+def _flatten_on(im, bg):
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        im = im.convert("RGBA")
+        canvas = Image.new("RGB", im.size, bg)
+        canvas.paste(im, mask=im.split()[3])
+        return canvas
+    return im.convert("RGB")
+
+
+def make_passport(img, w_mm, h_mm, zoom, off_x, off_y, bg, dpi=300):
+    """Photo ko w_mm x h_mm me katkar do. zoom<1 par kinare bg rang se bhar jate hain."""
+    W, H = round(w_mm / 25.4 * dpi), round(h_mm / 25.4 * dpi)
+    src = _flatten_on(img, bg)
+    aspect = w_mm / h_mm
+    bh = min(src.height, src.width / aspect) / zoom
+    bw = bh * aspect
+    cx = src.width / 2 + off_x / 100 * (src.width / 2)
+    cy = src.height / 2 + off_y / 100 * (src.height / 2)
+    x0, y0 = int(round(cx - bw / 2)), int(round(cy - bh / 2))
+    canvas = Image.new("RGB", (max(1, int(round(bw))), max(1, int(round(bh)))), bg)
+    canvas.paste(src, (-x0, -y0))
+    return canvas.resize((W, H), Image.LANCZOS)
+
+
+def make_sheet(photo, paper, copies=None, guides=True, dpi=300, margin_mm=2.0, gap_mm=1.0):
+    """Photo ki copies ek print sheet par lagao. Return: (sheet_image, max_fit)"""
+    pw_mm, ph_mm = PAPERS[paper]
+    mm = lambda v: round(v / 25.4 * dpi)
+    w, h = photo.size
+
+    def fit(PW, PH):
+        cols = int((mm(PW) - 2 * mm(margin_mm) + mm(gap_mm)) // (w + mm(gap_mm)))
+        rows = int((mm(PH) - 2 * mm(margin_mm) + mm(gap_mm)) // (h + mm(gap_mm)))
+        return max(cols, 0), max(rows, 0)
+
+    c1, r1 = fit(pw_mm, ph_mm)
+    c2, r2 = fit(ph_mm, pw_mm)
+    if c2 * r2 > c1 * r1:
+        PW, PH, cols, rows = ph_mm, pw_mm, c2, r2
+    else:
+        PW, PH, cols, rows = pw_mm, ph_mm, c1, r1
+    if cols * rows == 0:
+        raise RuntimeError("Is paper par ek bhi photo nahi aati. Bada paper chuniye.")
+    n = cols * rows if copies is None else max(1, min(int(copies), cols * rows))
+    gap = mm(gap_mm)
+    used_cols, used_rows = min(cols, n), -(-n // cols)
+    grid_w = used_cols * w + (used_cols - 1) * gap
+    grid_h = used_rows * h + (used_rows - 1) * gap
+    sheet = Image.new("RGB", (mm(PW), mm(PH)), "white")
+    ox, oy = (sheet.width - grid_w) // 2, (sheet.height - grid_h) // 2
+    draw = ImageDraw.Draw(sheet)
+    for i in range(n):
+        r, c = divmod(i, cols)
+        x, y = ox + c * (w + gap), oy + r * (h + gap)
+        sheet.paste(photo, (x, y))
+        if guides:
+            draw.rectangle([x - 1, y - 1, x + w, y + h], outline="#9AA3B2")
+    return sheet, cols * rows
+
+
+def _jpg(im, dpi=300, q=95):
+    b = io.BytesIO()
+    im.save(b, "JPEG", quality=q, dpi=(dpi, dpi), optimize=True)
+    return b.getvalue()
+
+
+def _pdf(im, dpi=300):
+    b = io.BytesIO()
+    im.save(b, "PDF", resolution=dpi)
+    return b.getvalue()
+
+
 st.set_page_config(page_title="Notice se Excel aur Word", page_icon="📄", layout="centered")
 
 CSS = """
@@ -618,53 +704,65 @@ CSS = """
 
 :root{
   --ink:#14213D; --muted:#5B6678; --paper:#F4F6F9; --card:#FFFFFF; --line:#D9DFE8;
-  --xl:#1D6F42; --xl-soft:#E4F2EA; --wd:#2B579A; --wd-soft:#E5ECF8; --pdf:#B3261E;
+  --xl:#1D6F42; --wd:#2B579A; --pdf:#B3261E; --teal:#0E7C86; --amber:#B26A00;
 }
 html, body, .stApp, [class*="css"]{ font-family:'Hind','Noto Sans Devanagari',sans-serif; color:var(--ink); }
 .stApp{ background:var(--paper); }
-.block-container{ max-width:760px; padding-top:2rem; padding-bottom:4rem; }
+.block-container{ max-width:780px; padding-top:1.8rem; padding-bottom:4rem; }
 #MainMenu, footer{ visibility:hidden; }
 
-/* hero */
-.hero{ margin:0 0 1.6rem 0; }
-.hero .files{ position:relative; height:84px; margin-bottom:.6rem; }
-.ft{ position:absolute; top:0; width:56px; height:68px; display:flex; align-items:flex-end;
-     padding:0 0 7px 8px; color:#fff; font:600 .82rem 'Hind',sans-serif; letter-spacing:.2px;
-     clip-path:polygon(0 0,68% 0,100% 24%,100% 100%,0 100%); border-radius:3px; }
-.ft.xl{ left:8px; top:6px; background:var(--xl); transform:rotate(-5deg); }
-.ft.wd{ left:56px; top:10px; background:var(--wd); transform:rotate(4deg); }
-.hero h1{ font-family:'Bricolage Grotesque',sans-serif; font-weight:800; font-size:2.35rem;
-          line-height:1.08; letter-spacing:-.8px; margin:0 0 .6rem 0; padding:0; max-width:560px; }
-.hero p{ font-size:1.06rem; line-height:1.5; color:var(--muted); max-width:520px; margin:0; }
+/* file-shaped badge: poore app ka ek hi motif */
+.fs{ flex:none; display:flex; align-items:flex-end; width:46px; height:56px; padding:0 0 6px 6px;
+     background:var(--c); color:#fff; font:600 .7rem/1.05 'Hind',sans-serif; border-radius:3px;
+     clip-path:polygon(0 0,68% 0,100% 24%,100% 100%,0 100%); }
+.fs.big{ width:56px; height:68px; font-size:.82rem; padding:0 0 7px 8px; }
 
-/* tabs: Excel hara, Word neela */
-.stTabs [data-baseweb="tab-list"]{ gap:0; border-bottom:1px solid var(--line); }
-.stTabs [data-baseweb="tab"]{ padding:.7rem 1.3rem; font-weight:600; font-size:1.02rem; color:var(--muted); }
-.stTabs [data-baseweb="tab"][aria-selected="true"]{ color:var(--ink); }
-.stTabs:has([data-baseweb="tab"]:nth-child(1)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--xl); height:3px; }
-.stTabs:has([data-baseweb="tab"]:nth-child(2)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--wd); height:3px; }
-.stTabs:has([data-baseweb="tab"]:nth-child(3)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--pdf); height:3px; }
-.stTabs:has([data-baseweb="tab"]:nth-child(n+4)[aria-selected="true"]) [data-baseweb="tab-highlight"]{ background:var(--ink); height:3px; }
-.stTabs [data-baseweb="tab-list"]{ overflow-x:auto; }
-.stTabs [data-baseweb="tab"]{ white-space:nowrap; }
+/* hero */
+.hero{ margin:.2rem 0 1.8rem 0; }
+.hero .files{ position:relative; height:88px; margin-bottom:.5rem; }
+.hero .fs{ position:absolute; top:6px; }
+.hero .fs:nth-child(1){ left:8px;  transform:rotate(-6deg); }
+.hero .fs:nth-child(2){ left:58px; top:10px; transform:rotate(3deg); }
+.hero .fs:nth-child(3){ left:108px; top:4px; transform:rotate(-2deg); }
+.hero h1{ font-family:'Bricolage Grotesque',sans-serif; font-weight:800; font-size:2.4rem; line-height:1.07;
+          letter-spacing:-.8px; margin:0 0 .65rem 0; padding:0; max-width:680px; text-wrap:balance; }
+.hero p{ font-size:1.07rem; line-height:1.5; color:var(--muted); max-width:520px; margin:0; }
+
+/* tool tiles (poora tile clickable) */
+[class*="st-key-tile_"]{ position:relative; gap:0 !important; margin-bottom:.15rem; }
+[class*="st-key-tile_"] .stButton{ position:absolute; inset:0; z-index:3; width:100%; height:100%; }
+[class*="st-key-tile_"] .stButton > button{ width:100%; height:100%; opacity:0; cursor:pointer; border:0; background:transparent; }
+.tile{ display:flex; align-items:center; gap:1rem; background:var(--card); border:1px solid var(--line);
+       border-radius:14px; padding:1rem 1.1rem; min-height:94px; border-left:5px solid var(--c); }
+.tile b{ display:block; font-family:'Bricolage Grotesque',sans-serif; font-weight:600; font-size:1.14rem; line-height:1.2; }
+.tile .d{ display:block; margin-top:.2rem; color:var(--muted); font-size:.93rem; line-height:1.35; }
+[class*="st-key-tile_"]:hover .tile{ border-color:var(--c); background:#FBFCFE; }
+[class*="st-key-tile_"]:focus-within .tile{ outline:2px solid var(--ink); outline-offset:2px; }
+
+/* tool page */
+.st-key-back button{ background:none; border:0; color:var(--muted); padding:0; min-height:0; font-weight:600; }
+.st-key-back button:hover{ color:var(--ink); text-decoration:underline; background:none; }
+.thead{ display:flex; align-items:center; gap:1rem; margin:.7rem 0 1.1rem 0; }
+.thead h2{ font-family:'Bricolage Grotesque',sans-serif; font-weight:800; font-size:1.9rem; letter-spacing:-.5px; line-height:1.1; margin:0; padding:0; }
+.thead p{ margin:.25rem 0 0 0; color:var(--muted); font-size:1rem; }
+.st-key-panel{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:1.3rem 1.4rem 1.5rem 1.4rem; }
 
 /* inputs */
-.stTextArea textarea{ background:var(--card); border:1px solid var(--line); border-radius:10px;
+.stTextArea textarea{ background:#FBFCFE; border:1px solid var(--line); border-radius:10px;
      font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.84rem; line-height:1.55; }
 .stTextArea textarea:focus{ border-color:var(--ink); box-shadow:0 0 0 2px rgba(20,33,61,.12); }
-[data-testid="stFileUploaderDropzone"]{ background:var(--card); border:1.5px dashed #9AA7BD; border-radius:12px; }
-div[role="radiogroup"]{ gap:.5rem; margin-bottom:.4rem; }
+[data-testid="stFileUploaderDropzone"]{ background:#FBFCFE; border:1.5px dashed #9AA7BD; border-radius:12px; }
+div[role="radiogroup"]{ gap:.5rem; margin-bottom:.3rem; }
+.hint{ color:var(--muted); font-size:.95rem; margin:.1rem 0 .9rem 0; }
 
-/* buttons */
+/* buttons: har tool ka apna rang */
 .stButton > button, .stDownloadButton > button{ border-radius:10px; font-weight:600; padding:.55rem 1.3rem; min-height:2.8rem; }
-[class*="st-key-go_x"] button{ background:var(--xl); border:1px solid var(--xl); color:#fff; }
-[class*="st-key-go_x"] button:hover{ background:#175a36; border-color:#175a36; color:#fff; }
-[class*="st-key-go_w"] button{ background:var(--wd); border:1px solid var(--wd); color:#fff; }
-[class*="st-key-go_w"] button:hover{ background:#22457b; border-color:#22457b; color:#fff; }
-[class*="st-key-go_p"] button{ background:var(--pdf); border:1px solid var(--pdf); color:#fff; }
-[class*="st-key-go_p"] button:hover{ background:#8f1e18; border-color:#8f1e18; color:#fff; }
-[class*="st-key-go_s"] button, [class*="st-key-go_c"] button{ background:var(--ink); border:1px solid var(--ink); color:#fff; }
-[class*="st-key-go_s"] button:hover, [class*="st-key-go_c"] button:hover{ background:#0b1428; border-color:#0b1428; color:#fff; }
+[class*="st-key-go_x"] button{ background:var(--xl);   border:1px solid var(--xl);   color:#fff; }
+[class*="st-key-go_w"] button{ background:var(--wd);   border:1px solid var(--wd);   color:#fff; }
+[class*="st-key-go_p"] button{ background:var(--pdf);  border:1px solid var(--pdf);  color:#fff; }
+[class*="st-key-go_s"] button{ background:var(--ink);  border:1px solid var(--ink);  color:#fff; }
+[class*="st-key-go_c"] button{ background:var(--teal); border:1px solid var(--teal); color:#fff; }
+[class*="st-key-go_"] button:hover{ filter:brightness(.88); color:#fff; }
 .stDownloadButton > button{ background:var(--card); border:1.5px solid var(--ink); color:var(--ink); }
 .stDownloadButton > button:hover{ background:var(--ink); color:#fff; border-color:var(--ink); }
 
@@ -672,25 +770,15 @@ div[role="radiogroup"]{ gap:.5rem; margin-bottom:.4rem; }
 [data-testid="stDataFrame"]{ border:1px solid var(--line); border-radius:10px; overflow:hidden; }
 [data-testid="stAlert"]{ border-radius:10px; }
 h3{ font-family:'Bricolage Grotesque',sans-serif; font-weight:600; letter-spacing:-.2px; }
-.hint{ color:var(--muted); font-size:.95rem; margin:.1rem 0 .9rem 0; }
 
 @media (max-width:640px){
-  .hero h1{ font-size:1.85rem; }
-  .stTabs [data-baseweb="tab"]{ padding:.7rem .9rem; }
+  .hero h1{ font-size:1.9rem; }
+  .thead h2{ font-size:1.55rem; }
+  .st-key-panel{ padding:1rem 1rem 1.2rem 1rem; }
 }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
-st.markdown(
-    """
-<div class="hero">
-  <div class="files"><span class="ft xl">.xlsx</span><span class="ft wd">.docx</span></div>
-  <h1>Notice ki roll list, seedha Excel ya Word me</h1>
-  <p>Notice ka link ya PDF do. Excel, Word ya PDF banao, ya kisi bhi file ka size aur format badlo.</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
 
 SRC = ["Notice links", "PDF upload"]
 LINKS_LABEL = "Notice links"
@@ -910,16 +998,15 @@ def ui_convert():
             offer_download(outs, "pdf_pages.zip", "Images download karo")
 
 
-tab_x, tab_w, tab_p, tab_s, tab_c = st.tabs(["Excel banao", "Word banao", "Link se PDF", "Size badlo", "Format badlo"])
-
-with tab_x:
+def ui_excel():
     src = st.radio("Data kahan se aayega?", SRC, horizontal=True, key="src_x")
     if src == SRC[0]:
         ui_links_to_excel()
     else:
         ui_pdf_to_excel()
 
-with tab_w:
+
+def ui_word():
     kind = st.radio("Word kaisa chahiye?", ["PDF jaisa layout", "Saaf table"], horizontal=True, key="kind_w")
     if kind == "Saaf table":
         ui_table_to_word()
@@ -930,11 +1017,138 @@ with tab_w:
         else:
             ui_pdf_to_word()
 
-with tab_p:
-    ui_links_to_pdf()
 
-with tab_s:
-    ui_resize()
+def ui_passport():
+    st.markdown('<div class="hint">Photo upload kijiye, size aur rang chuniye. Photo katkar sahi size me aayegi aur print ke liye sheet bhi banegi.</div>',
+                unsafe_allow_html=True)
+    up = st.file_uploader("Photo chuniye", type=["jpg", "jpeg", "png", "webp"], key="up_f")
+    if up is None:
+        return
+    try:
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(up.getvalue())))
+        img.load()
+    except Exception as e:
+        st.error(f"Photo khul nahi payi: {e}")
+        return
 
-with tab_c:
-    ui_convert()
+    c1, c2 = st.columns(2)
+    preset = c1.selectbox("Photo ka size", list(PHOTO_SIZES), key="size_f")
+    bgname = c2.selectbox("Background rang", list(PHOTO_BG), key="bg_f")
+    dims = PHOTO_SIZES[preset]
+    if dims is None:
+        d1, d2 = st.columns(2)
+        dims = (d1.number_input("Chaudai (mm)", 10.0, 200.0, 35.0, 1.0, key="w_f"),
+                d2.number_input("Lambai (mm)", 10.0, 200.0, 45.0, 1.0, key="h_f"))
+    bg = PHOTO_BG[bgname] or st.color_picker("Rang chuniye", "#FFFFFF", key="bgc_f")
+
+    st.caption("Chehra frame me beech me aaye, isliye zoom aur position se adjust kijiye. Zoom 1 se kam karne par kinare chune hue rang se bhar jate hain.")
+    zoom = st.slider("Zoom", 0.5, 3.0, 1.0, 0.05, key="zoom_f")
+    s1, s2 = st.columns(2)
+    off_x = s1.slider("Left / Right", -100, 100, 0, key="ox_f")
+    off_y = s2.slider("Upar / Neeche", -100, 100, 0, key="oy_f")
+
+    photo = make_passport(img, dims[0], dims[1], zoom, off_x, off_y, bg)
+    st.image(photo, width=min(300, photo.width // 2),
+             caption=f"{dims[0]:g} × {dims[1]:g} mm  ({photo.width} × {photo.height} px, 300 dpi)")
+
+    st.markdown("**Print sheet**")
+    p1, p2 = st.columns(2)
+    paper = p1.selectbox("Paper", list(PAPERS), key="paper_f")
+    guides = p2.checkbox("Katne ke liye line", value=True, key="guides_f")
+    _, max_fit = make_sheet(photo, paper, 1, guides)
+    allcopies = st.checkbox(f"Jitni aa sake utni (is paper par {max_fit})", value=True, key="all_f")
+    copies = None if allcopies else st.number_input("Kitni copies", 1, max(max_fit, 1), min(6, max_fit), key="copies_f")
+    sheet, _ = make_sheet(photo, paper, copies, guides)
+
+    limit_on = st.checkbox("Photo ka file size set karna hai (jaise form me 20 se 50 KB)", key="lim_f")
+    photo_bytes = _jpg(photo)
+    if limit_on:
+        kb = st.number_input("Photo ka size (KB)", 5, 5000, 50, 5, key="kb_f")
+        try:
+            photo_bytes, note = resize_file("photo.jpg", photo_bytes, int(kb * 1024))
+            st.caption(f"Photo file: {human(len(photo_bytes))}")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    st.image(sheet, caption=f"{paper} sheet", use_container_width=True)
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("Photo (JPG)", photo_bytes, "passport_photo.jpg", "image/jpeg", key="dl_f1")
+    d2.download_button("Sheet (JPG)", _jpg(sheet), "passport_sheet.jpg", "image/jpeg", key="dl_f2")
+    d3.download_button("Sheet (PDF)", _pdf(sheet), "passport_sheet.pdf", "application/pdf", key="dl_f3")
+
+
+TOOLS = [
+    {"id": "excel", "name": "Excel banao", "badge": ".xlsx", "color": "var(--xl)", "fn": ui_excel,
+     "desc": "Notice ki roll list ka Excel, links ya PDF se"},
+    {"id": "word", "name": "Word banao", "badge": ".docx", "color": "var(--wd)", "fn": ui_word,
+     "desc": "PDF jaisa layout ya saaf table, Word me"},
+    {"id": "pdf", "name": "Link se PDF", "badge": ".pdf", "color": "var(--pdf)", "fn": ui_links_to_pdf,
+     "desc": "Notice ki PDF seedha download karo"},
+    {"id": "size", "name": "Size badlo", "badge": "KB<br>MB", "color": "var(--ink)", "fn": ui_resize,
+     "desc": "PDF, Word, Excel aur image ka size chhota ya bada karo"},
+    {"id": "convert", "name": "Format badlo", "badge": "JPG<br>PNG", "color": "var(--teal)", "fn": ui_convert,
+     "desc": "Image aur PDF ko ek dusre me badlo"},
+    {"id": "photo", "name": "Passport photo", "badge": "35×<br>45", "color": "var(--amber)", "fn": ui_passport,
+     "desc": "Photo sahi size me katkar print sheet banao"},
+]
+TOOL_BY_ID = {t["id"]: t for t in TOOLS}
+
+if "tool" not in st.session_state:
+    st.session_state["tool"] = None
+
+
+def open_tool(tool_id):
+    st.session_state["tool"] = tool_id
+
+
+def tile_box(key):
+    try:
+        return st.container(key=key)
+    except TypeError:  # purana Streamlit
+        return st.container()
+
+
+def show_home():
+    st.markdown(
+        """
+<div class="hero">
+  <div class="files">
+    <span class="fs big" style="--c:var(--xl)">.xlsx</span>
+    <span class="fs big" style="--c:var(--wd)">.docx</span>
+    <span class="fs big" style="--c:var(--pdf)">.pdf</span>
+  </div>
+  <h1>Notice aur files ke kaam, ek hi jagah</h1>
+  <p>Roll list ka Excel ya Word banao, PDF nikalo, file ka size badlo, ya passport photo banao.</p>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    for i in range(0, len(TOOLS), 2):
+        cols = st.columns(2)
+        for col, t in zip(cols, TOOLS[i:i + 2]):
+            with col:
+                with tile_box(f"tile_{t['id']}"):
+                    st.markdown(
+                        f'<div class="tile" style="--c:{t["color"]}"><span class="fs">{t["badge"]}</span>'
+                        f'<div><b>{t["name"]}</b><span class="d">{t["desc"]}</span></div></div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.button(f"{t['name']} kholo", key=f"tilebtn_{t['id']}", on_click=open_tool, args=(t["id"],))
+
+
+def show_tool(t):
+    st.button("← Saare tools", key="back", on_click=open_tool, args=(None,))
+    st.markdown(
+        f'<div class="thead" style="--c:{t["color"]}"><span class="fs big">{t["badge"]}</span>'
+        f'<div><h2>{t["name"]}</h2><p>{t["desc"]}</p></div></div>',
+        unsafe_allow_html=True,
+    )
+    with tile_box("panel"):
+        t["fn"]()
+
+
+current = TOOL_BY_ID.get(st.session_state["tool"])
+if current is None:
+    show_home()
+else:
+    show_tool(current)
