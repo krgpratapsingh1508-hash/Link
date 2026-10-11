@@ -154,7 +154,17 @@ def extract_table(pdf_bytes):
     # Asli header row dhundo (title/college ke naam wali upar ki rows ko chhodo)
     h_idx = next((i for i, r in enumerate(rows[:25]) if _is_header_row(r)), None)
     if h_idx is not None:
-        header = [std_header(c) for c in rows[h_idx]]
+        raw = rows[h_idx]
+        header = [std_header(c) for c in raw]
+        # Agar ek hi table me do column "Father/Mother Name" ban rahe hon (Father alag, Mother alag), to unhe alag naam do
+        idx = [i for i, h in enumerate(header) if h == "Father/Mother Name"]
+        if len(idx) > 1:
+            for i in idx:
+                r = _norm(raw[i])
+                if "mother" in r or "माता" in r:
+                    header[i] = "Mother Name"
+                elif "father" in r or "पिता" in r:
+                    header[i] = "Father Name"
         body = rows[h_idx + 1:]
     elif rows[0][0].strip().isdigit():
         # Header hai hi nahi, seedha data: pehla column S. No., doosra Student Name maano
