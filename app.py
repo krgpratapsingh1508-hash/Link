@@ -1309,6 +1309,24 @@ def cut_cached(data, method, tol, model, edge):
     return cutout_simple(img, tol)
 
 
+def slider_pm(label, lo, hi, default, step, key, help=None, box=None):
+    """Slider ke saath - aur + button (ek-ek step se badlane ke liye)."""
+    box = box or st
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+    def bump(d):
+        v = st.session_state[key] + d
+        v = min(hi, max(lo, v))
+        st.session_state[key] = round(v, 4) if isinstance(step, float) else int(v)
+
+    val = box.slider(label, lo, hi, step=step, key=key, help=help)
+    b1, b2, _ = box.columns([1, 1, 4])
+    b1.button("−", key=key + "_minus", on_click=bump, args=(-step,), use_container_width=True)
+    b2.button("+", key=key + "_plus", on_click=bump, args=(step,), use_container_width=True)
+    return val
+
+
 def ui_passport():
     st.markdown('<div class="hint">Photo upload kijiye. Background badal sakte hain, neeche naam aur date likh sakte hain, aur print sheet bana sakte hain.</div>',
                 unsafe_allow_html=True)
@@ -1349,10 +1367,10 @@ def ui_passport():
         if method == "ai":
             model = AI_MODELS[st.selectbox("AI model", list(AI_MODELS), key="model_f")]
         elif method == "simple":
-            tol = st.slider("Kitna background hataye", 10, 150, 60, 5, key="tol_f",
+            tol = slider_pm("Kitna background hataye", 10, 150, 60, 5, "tol_f",
                             help="Kinare kate-phate ya background bacha ho to badlaiye. Kam = kam hatata hai, zyada = zyada hatata hai.")
         else:
-            edge = st.slider("Kinara andar karo", 0, 4, 1, key="edge_f",
+            edge = slider_pm("Kinara andar karo", 0, 4, 1, 1, "edge_f",
                              help="Purane background ki halki line bachi ho to badhaiye.")
             st.caption("Aadmi frame ke beech me aur chehra saaf dikhna chahiye.")
         try:
@@ -1388,16 +1406,16 @@ def ui_passport():
         mode_label = st.radio("Strip kahan rakhein?", ["Photo ke andar (size same rahega)", "Photo ke neeche alag se (photo thodi lambi hogi)"],
                               key="mode_f")
         mode = "inside" if mode_label.startswith("Photo ke andar") else "below"
-        strip_mm = st.slider("Strip ki unchai (mm)", 4.0, 12.0, 7.0, 0.5, key="strip_f")
+        strip_mm = slider_pm("Strip ki unchai (mm)", 4.0, 12.0, 7.0, 0.5, "strip_f")
         st.caption("Naam English (Roman) letters me likhna best hai.")
 
     # ---- 3. chehra set karo ----
     st.markdown("**3. Chehra frame me set karo**")
     st.caption("Chehra beech me aaye, isliye zoom aur position se adjust kijiye. Zoom 1 se kam karne par kinare naye rang se bhar jate hain.")
-    zoom = st.slider("Zoom", 0.5, 3.0, 1.0, 0.05, key="zoom_f")
+    zoom = slider_pm("Zoom", 0.5, 3.0, 1.0, 0.05, "zoom_f")
     s1, s2 = st.columns(2)
-    off_x = s1.slider("Left / Right", -100, 100, 0, key="ox_f")
-    off_y = s2.slider("Upar / Neeche", -100, 100, 0, key="oy_f")
+    off_x = slider_pm("Left / Right", -100, 100, 0, 1, "ox_f", box=s1)
+    off_y = slider_pm("Upar / Neeche", -100, 100, 0, 1, "oy_f", box=s2)
 
     photo = make_passport(work, dims[0], dims[1], zoom, off_x, off_y, bg, lines=lines, mode=mode, strip_mm=strip_mm)
     st.image(photo, width=min(300, photo.width // 2),
