@@ -60,7 +60,7 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/pdf,*/*",
 }
-DEFAULT_URL = "https://krg.ac.in/notice/355/"
+DEFAULT_URL = "Hello yaha link Paste karo"
 
 
 def fetch(url, timeout=60):
